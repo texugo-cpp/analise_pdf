@@ -1,6 +1,8 @@
 import sys
 import os
 import tempfile
+import json
+import decimal  # Adicionar importação para decimal
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QPushButton, QFileDialog, 
                             QLabel, QVBoxLayout, QHBoxLayout, QWidget, QScrollArea,
                             QListWidget, QListWidgetItem, QMessageBox, QInputDialog,
@@ -14,10 +16,27 @@ import fitz  # PyMuPDF
 class PDFAnalyzerApp(QMainWindow):
     def __init__(self):
         super().__init__()
+        self.config_file = os.path.join(os.path.expanduser("~"), ".pdf_analyzer_config.json")
+        self.load_config()  # Carregar configuração salva
         self.initUI()
         self.current_pdf_path = None
         self.page_images = []
-        self.poppler_path = None
+        # Configurar log
+        self.setup_logging()
+
+    def setup_logging(self):
+        """Configurar o sistema de log simples"""
+        import logging
+        self.logger = logging.getLogger("PDFAnalyzer")
+        self.logger.setLevel(logging.INFO)
+        
+        if not self.logger.handlers:
+            # Criar handler para console
+            console_handler = logging.StreamHandler()
+            console_handler.setLevel(logging.INFO)
+            formatter = logging.Formatter('%(name)s - %(levelname)s - %(message)s')
+            console_handler.setFormatter(formatter)
+            self.logger.addHandler(console_handler)
 
     def initUI(self):
         self.setWindowTitle('Analisador de PDF')
@@ -31,6 +50,8 @@ class PDFAnalyzerApp(QMainWindow):
         
         # Botão para configurar Poppler (opcional)
         self.poppler_btn = QPushButton('Configurar Poppler (Opcional)', self)
+        if self.poppler_path:
+            self.poppler_btn.setText(f'Poppler: {self.poppler_path}')
         self.poppler_btn.clicked.connect(self.set_poppler_path)
         left_panel.addWidget(self.poppler_btn)
         
@@ -74,6 +95,15 @@ class PDFAnalyzerApp(QMainWindow):
         
         self.tabs.addTab(self.box_tab, "Boxes de Página")
         
+        # Tab para erros e avisos
+        self.log_tab = QWidget()
+        self.log_layout = QVBoxLayout(self.log_tab)
+        self.log_text = QLabel("Nenhum erro ou aviso registrado.")
+        self.log_text.setWordWrap(True)
+        self.log_layout.addWidget(self.log_text)
+        
+        self.tabs.addTab(self.log_tab, "Erros e Avisos")
+        
         # Adicionar TabWidget ao painel central
         center_panel.addWidget(self.tabs)
         
@@ -104,19 +134,70 @@ class PDFAnalyzerApp(QMainWindow):
         
         # Variáveis para armazenar dados das páginas
         self.page_data = []
+        self.log_messages = []
+
+    def load_config(self):
+        """Carrega a configuração salva do arquivo"""
+        self.poppler_path = None
+        try:
+            if os.path.exists(self.config_file):
+                with open(self.config_file, 'r') as f:
+                    config = json.load(f)
+                    self.poppler_path = config.get('poppler_path')
+        except Exception as e:
+            print(f"Erro ao carregar configuração: {str(e)}")
+
+    def save_config(self):
+        """Salva a configuração atual em um arquivo"""
+        try:
+            config = {
+                'poppler_path': self.poppler_path
+            }
+            with open(self.config_file, 'w') as f:
+                json.dump(config, f)
+        except Exception as e:
+            print(f"Erro ao salvar configuração: {str(e)}")
+            QMessageBox.warning(self, "Aviso", f"Não foi possível salvar a configuração: {str(e)}")
+    
+    def add_log_message(self, message, level="INFO"):
+        """Adiciona uma mensagem ao log interno do aplicativo"""
+        self.log_messages.append(f"{level}: {message}")
+        log_text = "<br/>".join(self.log_messages)
+        self.log_text.setText(f"<html><body>{log_text}</body></html>")
+        
+        # Também envia para o logger do sistema
+        if hasattr(self, 'logger'):
+            if level == "ERROR":
+                self.logger.error(message)
+            elif level == "WARNING":
+                self.logger.warning(message)
+            else:
+                self.logger.info(message)
         
     def set_poppler_path(self):
+        """Configura e salva o caminho do Poppler"""
         path, ok = QInputDialog.getText(
             self, 'Configurar Poppler', 
             'Digite o caminho completo para a pasta bin do Poppler:\n'
             'Ex: C:\\Poppler\\bin ou /usr/local/bin',
-            QLineEdit.Normal
+            QLineEdit.Normal,
+            self.poppler_path or ""
         )
         
-        if ok and path:
-            self.poppler_path = path
-            QMessageBox.information(self, "Configuração Salva", 
-                                  f"Caminho do Poppler configurado para: {path}")
+        if ok:
+            if path.strip():
+                self.poppler_path = path.strip()
+                self.poppler_btn.setText(f'Poppler: {self.poppler_path}')
+                self.save_config()
+                QMessageBox.information(self, "Configuração Salva", 
+                                    f"Caminho do Poppler configurado para: {path}")
+            else:
+                # Se o caminho estiver em branco, limpar a configuração
+                self.poppler_path = None
+                self.poppler_btn.setText('Configurar Poppler (Opcional)')
+                self.save_config()
+                QMessageBox.information(self, "Configuração Removida", 
+                                    "Caminho do Poppler removido")
 
     def upload_pdf(self):
         options = QFileDialog.Options()
@@ -130,11 +211,16 @@ class PDFAnalyzerApp(QMainWindow):
     
     def analyze_pdf(self, pdf_path):
         try:
-            # Limpar visualizações anteriores
+            # Limpar visualizações e logs anteriores
             self.page_list.clear()
             self.clear_preview()
             self.box_table.setRowCount(0)
             self.page_data = []
+            self.log_messages = []
+            self.log_text.setText("Nenhum erro ou aviso registrado.")
+            
+            # Adicionar primeira mensagem de log
+            self.add_log_message(f"Analisando arquivo: {os.path.basename(pdf_path)}")
             
             # Abrir o PDF e obter informações básicas
             with open(pdf_path, 'rb') as file:
@@ -145,16 +231,40 @@ class PDFAnalyzerApp(QMainWindow):
                 file_name = os.path.basename(pdf_path)
                 self.info_label.setText(f'Arquivo: {file_name}\nTotal de páginas: {num_pages}')
                 
+                # Análise adicional com PyMuPDF para formatos problemáticos
+                pymupdf_doc = fitz.open(pdf_path)
+                
                 # Analisar cada página
                 page_formats = []
                 
                 for i in range(num_pages):
                     page = pdf_reader.pages[i]
                     page_info = self.analyze_page_boxes(page, i)
+                    
+                    # Usar PyMuPDF como backup para obter tamanho da página
+                    if not page_info.get('MediaBox') and i < len(pymupdf_doc):
+                        pymupdf_page = pymupdf_doc[i]
+                        rect = pymupdf_page.rect
+                        width_pt = rect.width
+                        height_pt = rect.height
+                        width_mm = width_pt * 0.352778
+                        height_mm = height_pt * 0.352778
+                        
+                        page_info['MediaBox'] = {
+                            'width': width_mm,
+                            'height': height_mm,
+                            'x': 0,
+                            'y': 0,
+                            'raw': (0, 0, width_pt, height_pt),
+                            'source': 'PyMuPDF' # Marcar que veio do PyMuPDF
+                        }
+                        
+                        self.add_log_message(f"Usando PyMuPDF para obter MediaBox na página {i+1}", "INFO")
+                    
                     self.page_data.append(page_info)
                     
                     # Determinar o formato (retrato, paisagem, etc.)
-                    mediabox = page_info['MediaBox'] if 'MediaBox' in page_info else None
+                    mediabox = page_info.get('MediaBox')
                     if mediabox:
                         width, height = mediabox['width'], mediabox['height']
                         if width > height:
@@ -168,14 +278,19 @@ class PDFAnalyzerApp(QMainWindow):
                         page_formats.append(format_info)
                         
                         # Adicionar à lista
-                        self.page_list.addItem(f"Página {i+1}: {format_info}")
+                        source = mediabox.get('source', 'PyPDF2')
+                        self.page_list.addItem(f"Página {i+1}: {format_info} [{source}]")
                     else:
                         self.page_list.addItem(f"Página {i+1}: Formato desconhecido")
                         page_formats.append("Desconhecido")
+                        self.add_log_message(f"Não foi possível determinar o formato da página {i+1}", "WARNING")
+                
+                pymupdf_doc.close()
             
             # Verificar se há formatos diferentes
             if len(set(page_formats)) > 1:
                 self.format_alert.setText("ALERTA: O documento contém páginas com formatos diferentes!")
+                self.add_log_message("O documento contém páginas com formatos diferentes", "WARNING")
             else:
                 self.format_alert.setText("")
             
@@ -185,11 +300,18 @@ class PDFAnalyzerApp(QMainWindow):
             # Selecionar a primeira página automaticamente
             if num_pages > 0:
                 self.page_list.setCurrentRow(0)
+            
+            # Se houver mensagens de log, mostrar a aba de logs
+            if len(self.log_messages) > 1:  # Mais que só a mensagem inicial
+                self.tabs.setCurrentIndex(1)  # Índice da aba de logs
         
         except Exception as e:
             import traceback
-            self.info_label.setText(f"Erro ao analisar o PDF: {str(e)}")
-            QMessageBox.critical(self, "Erro", f"Erro ao analisar o PDF: {str(e)}\n\n{traceback.format_exc()}")
+            error_msg = f"Erro ao analisar o PDF: {str(e)}"
+            self.info_label.setText(error_msg)
+            self.add_log_message(error_msg, "ERROR")
+            self.add_log_message(traceback.format_exc(), "ERROR")
+            QMessageBox.critical(self, "Erro", error_msg)
     
     def analyze_page_boxes(self, page, page_index):
         page_info = {}
@@ -203,7 +325,22 @@ class PDFAnalyzerApp(QMainWindow):
                 if hasattr(page, box_type.lower()):
                     box = getattr(page, box_type.lower())
                     if box:
-                        x1, y1, x2, y2 = box
+                        # Converter todos os valores para float para evitar problemas com Decimal
+                        try:
+                            x1 = float(box[0])
+                            y1 = float(box[1])
+                            x2 = float(box[2])
+                            y2 = float(box[3])
+                        except (TypeError, ValueError) as e:
+                            # Se falhar a conversão direta, tentar ver se é Decimal
+                            if isinstance(box[0], decimal.Decimal):
+                                x1 = float(box[0])
+                                y1 = float(box[1])
+                                x2 = float(box[2])
+                                y2 = float(box[3])
+                            else:
+                                raise e
+                        
                         width = abs(x2 - x1)
                         height = abs(y2 - y1)
                         
@@ -221,7 +358,8 @@ class PDFAnalyzerApp(QMainWindow):
                             'raw': (x1, y1, x2, y2)
                         }
             except Exception as e:
-                print(f"Erro ao analisar {box_type} na página {page_index+1}: {str(e)}")
+                error_msg = f"Erro ao analisar {box_type} na página {page_index+1}: {str(e)}"
+                self.add_log_message(error_msg, "WARNING")
         
         return page_info
     
@@ -244,7 +382,10 @@ class PDFAnalyzerApp(QMainWindow):
             self.box_table.insertRow(row_position)
             
             # Adicionar informações na tabela
-            self.box_table.setItem(row_position, 0, QTableWidgetItem(box_type))
+            source = box_data.get('source', 'PyPDF2')
+            display_type = f"{box_type} [{source}]" if 'source' in box_data else box_type
+            
+            self.box_table.setItem(row_position, 0, QTableWidgetItem(display_type))
             self.box_table.setItem(row_position, 1, QTableWidgetItem(f"{box_data['width']:.2f}"))
             self.box_table.setItem(row_position, 2, QTableWidgetItem(f"{box_data['height']:.2f}"))
             self.box_table.setItem(row_position, 3, QTableWidgetItem(f"{box_data['x']:.2f}"))
@@ -304,7 +445,9 @@ class PDFAnalyzerApp(QMainWindow):
             pdf_document.close()
         
         except Exception as e:
-            error_label = QLabel(f"Erro ao gerar previews: {str(e)}")
+            error_msg = f"Erro ao gerar previews: {str(e)}"
+            self.add_log_message(error_msg, "ERROR")
+            error_label = QLabel(error_msg)
             error_label.setStyleSheet("color: red;")
             self.preview_layout.addWidget(error_label)
     
@@ -347,7 +490,9 @@ class PDFAnalyzerApp(QMainWindow):
             pdf_document.close()
         
         except Exception as e:
-            error_label = QLabel(f"Erro ao gerar preview: {str(e)}")
+            error_msg = f"Erro ao gerar preview: {str(e)}"
+            self.add_log_message(error_msg, "ERROR")
+            error_label = QLabel(error_msg)
             error_label.setStyleSheet("color: red;")
             self.preview_layout.addWidget(error_label)
     
@@ -379,7 +524,9 @@ class PDFAnalyzerApp(QMainWindow):
                     width = page_info[box_type]['width']
                     height = page_info[box_type]['height']
                     color = colors.get(box_type, 'black')
-                    box_text += f"<span style='color:{color};'>■</span> <b>{box_type}:</b> {width:.2f}mm x {height:.2f}mm<br>"
+                    source = page_info[box_type].get('source', '')
+                    source_info = f" [{source}]" if source else ""
+                    box_text += f"<span style='color:{color};'>■</span> <b>{box_type}{source_info}:</b> {width:.2f}mm x {height:.2f}mm<br>"
                 
                 # Explicação dos boxes
                 box_text += "<br><b>Significado dos boxes:</b><br>"
